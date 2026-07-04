@@ -1,0 +1,8 @@
+# .gitignore
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.crypto
+*.asvars
+.ansible_vault_pass
+secrets.yml

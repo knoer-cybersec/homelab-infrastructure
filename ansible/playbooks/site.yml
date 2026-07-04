@@ -1,0 +1,141 @@
+- name: Production Edge Node Hardening
+  hosts: edge_nodes
+  gather_facts: true
+  become: true
+  vars:
+    custom_ssh_port: 2222
+    admin_user: ansible_admin
+
+  tasks:
+    - name: Run safe APT upgrade cycle
+      apt:
+        update_cache: yes
+        upgrade: safe
+        cache_valid_time: 3600
+
+    - name: Install baseline dependencies and security tools
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+          - curl
+          - git
+        state: present
+
+    - name: Create non-root system administrative user
+      user:
+        name: "{{ admin_user }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        state: present
+
+    - name: Deploy authorized deployment public key
+      authorized_key:
+        user: "{{ admin_user }}"
+        state: present
+        key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+
+    - name: Establish passwordless sudo escalation (Sudoers Isolation)
+      copy:
+        content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL"
+        dest: "/etc/sudoers.d/{{ admin_user }}"
+        mode: '0440'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Modify SSH Daemon configuration (Lockdown Directives)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?Port ', line: 'Port {{ custom_ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin ', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication ', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?PubkeyAuthentication ', line: 'PubkeyAuthentication yes' }
+      notify: Trigger SSHD Reboot
+
+    - name: Allow custom SSH port in local UFW firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ custom_ssh_port | string }}"
+        proto: tcp
+
+    - name: Set UFW default security policies (Zero-Trust)
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: incoming, policy: deny }
+        - { direction: outgoing, policy: allow }
+
+    - name: Enforce and enable UFW Firewall state
+      community.general.ufw:
+        state: enabled
+
+    - name: Enable automatic unattended updates
+      copy:
+        src: /usr/share/unattended-upgrades/20auto-upgrades
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        remote_src: yes
+
+    - name: Configure hardened kernel parameters (Sysctl)
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      loop:
+        # Prevent IP Spoofing (Reverse Path Filtering)
+        - { key: 'net.ipv4.conf.all.rp_filter', value: '1' }
+        - { key: 'net.ipv4.conf.default.rp_filter', value: '1' }
+        # Do not accept ICMP redirects (prevents MITM route hijacking)
+        - { key: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { key: 'net.ipv6.conf.all.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        # Protect against TCP SYN Flood attacks
+        - { key: 'net.ipv4.tcp_syncookies', value: '1' }
+        - { key: 'net.ipv4.tcp_max_syn_backlog', value: '2048' }
+        - { key: 'net.ipv4.tcp_synack_retries', value: '2' }
+        # Disable source routing (prevents packet routing exploitation)
+        - { key: 'net.ipv4.conf.all.accept_source_route', value: '0' }
+        - { key: 'net.ipv6.conf.all.accept_source_route', value: '0' }
+    
+    - name: Harden /dev/shm mount options
+      ansible.posix.mount:
+        path: /dev/shm
+        src: tmpfs
+        fstype: tmpfs
+        opts: defaults,noexec,nosuid,nodev
+        state: remounted
+
+    - name: Restrict dmesg and kernel pointers access
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      loop:
+        - { key: 'kernel.dmesg_restrict', value: '1' }
+        - { key: 'kernel.kptr_restrict', value: '2' }
+
+    - name: Ensure fail2ban is enabled at boot
+      systemd:
+        name: fail2ban
+        enabled: yes
+
+    - name: Ensure fail2ban is running (Enforcing Idempotency)
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+      changed_when: false # Prevents the Debian 12 Systemd status-timestamp bug from reporting false-positive changes
+
+  handlers:
+    - name: Trigger SSHD Reboot
+      systemd:
+        name: sshd
+        state: restarted

@@ -1,0 +1,33 @@
+- name: Deploy TP-Link Omada Controller in Docker
+  hosts: edge_nodes
+  gather_facts: false
+  vars:
+    omada_data_dir: /opt/omada
+    omada_ver: "5.15"  # Stabile, bewährte Controller-Version
+
+  tasks:
+    - name: Ensure target application directories exist with correct container permissions
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        owner: "508"  # UID des 'omada'-Users im mbentley-Container
+        group: "508"  # GID des 'omada'-Users im mbentley-Container
+      loop:
+        - "{{ omada_data_dir }}/data"
+        - "{{ omada_data_dir }}/logs"
+
+    - name: Start Omada Controller Container
+      community.docker.docker_container:
+        name: omada-controller
+        image: "mbentley/omada-controller:{{ omada_ver }}"
+        state: started
+        restart_policy: unless-stopped
+        network_mode: host  # Host-Modus wird von TP-Link wegen der Discovery-Pakete dringend empfohlen
+        env:
+          TZ: "Europe/Berlin"
+          MANAGE_HTTP_PORT: "8088"  # Korrigiert: Standard-HTTP-Port von Omada
+          MANAGE_HTTPS_PORT: "8043" # Korrigiert: Standard-HTTPS-Port von Omada
+        volumes:
+          - "{{ omada_data_dir }}/data:/opt/tplink/EAPController/data"
+          - "{{ omada_data_dir }}/logs:/opt/tplink/EAPController/logs"

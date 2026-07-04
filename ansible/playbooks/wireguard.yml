@@ -1,0 +1,230 @@
+- name: Install and configure WireGuard VPN Hub
+  hosts: edge_nodes
+  gather_facts: true
+  become: true
+  vars:
+    vpn_network: "10.8.0.0/24"
+    vpn_port: 51820
+    server_ip: "10.8.0.1/24"
+    
+    # Client Tunnel IPs (Host IPs inside the tunnel)
+    germany_01_ip: "10.8.0.2/32"
+    kenya_01_ip: "10.8.0.3/32"
+    admin_01_ip: "10.8.0.4/32"
+
+    # Local Physical LAN Subnets of your sites
+    germany_01_lan: "192.168.10.0/24"
+    kenya_01_lan: "192.168.20.0/24"
+
+  tasks:
+    - name: Install WireGuard and routing tools
+      ansible.builtin.apt:
+        name:
+          - wireguard
+          - iptables
+          - resolvconf
+        state: present
+        update_cache: yes
+
+    - name: Create WireGuard directory with secure permissions
+      ansible.builtin.file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    # --- KEY GENERATION (Idempotent) ---
+
+    - name: Check if server keys already exist
+      ansible.builtin.stat:
+        path: /etc/wireguard/server.key
+      register: server_key_state
+
+    - name: Generate server key pair
+      ansible.builtin.shell: |
+        wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+      when: not server_key_state.stat.exists
+      changed_when: true
+
+    - name: Check if Germany 01 keys already exist
+      ansible.builtin.stat:
+        path: /etc/wireguard/germany_01.key
+      register: germany_01_key_state
+
+    - name: Generate Germany 01 key pair
+      ansible.builtin.shell: |
+        wg genkey | tee /etc/wireguard/germany_01.key | wg pubkey > /etc/wireguard/germany_01.pub
+      when: not germany_01_key_state.stat.exists
+      changed_when: true
+
+    - name: Check if Kenya 01 keys already exist
+      ansible.builtin.stat:
+        path: /etc/wireguard/kenya_01.key
+      register: kenya_01_key_state
+
+    - name: Generate Kenya 01 key pair
+      ansible.builtin.shell: |
+        wg genkey | tee /etc/wireguard/kenya_01.key | wg pubkey > /etc/wireguard/kenya_01.pub
+      when: not kenya_01_key_state.stat.exists
+      changed_when: true
+
+    - name: Check if Admin 01 keys already exist
+      ansible.builtin.stat:
+        path: /etc/wireguard/admin_01.key
+      register: admin_01_key_state
+
+    - name: Generate Admin 01 key pair
+      ansible.builtin.shell: |
+        wg genkey | tee /etc/wireguard/admin_01.key | wg pubkey > /etc/wireguard/admin_01.pub
+      when: not admin_01_key_state.stat.exists
+      changed_when: true
+
+    # --- READ KEYS ---
+
+    - name: Slurp keys into Ansible variables
+      ansible.builtin.slurp:
+        src: "/etc/wireguard/{{ item }}"
+      register: wg_keys
+      loop:
+        - server.key
+        - server.pub
+        - germany_01.key
+        - germany_01.pub
+        - kenya_01.key
+        - kenya_01.pub
+        - admin_01.key
+        - admin_01.pub
+
+    - name: Assign key variables
+      ansible.builtin.set_fact:
+        server_private_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'server.key') | first).content | b64decode | trim }}"
+        server_public_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'server.pub') | first).content | b64decode | trim }}"
+        germany_01_private_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'germany_01.key') | first).content | b64decode | trim }}"
+        germany_01_public_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'germany_01.pub') | first).content | b64decode | trim }}"
+        kenya_01_private_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'kenya_01.key') | first).content | b64decode | trim }}"
+        kenya_01_public_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'kenya_01.pub') | first).content | b64decode | trim }}"
+        admin_01_private_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'admin_01.key') | first).content | b64decode | trim }}"
+        admin_01_public_key: "{{ (wg_keys.results | selectattr('item', 'equalto', 'admin_01.pub') | first).content | b64decode | trim }}"
+
+    # --- NETWORK & ROUTING CONFIGURATION ---
+
+    - name: Enable IPv4 packet forwarding in kernel (Sysctl)
+      ansible.posix.sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: Write WireGuard server configuration (wg0.conf)
+      ansible.builtin.copy:
+        dest: /etc/wireguard/wg0.conf
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          [Interface]
+          Address = {{ server_ip }}
+          ListenPort = {{ vpn_port }}
+          PrivateKey = {{ server_private_key }}
+          
+          # Routing & NAT masquerading on interface start/stop
+          PostUp = ufw route allow in on wg0 out on eth0
+          PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+          PostDown = ufw route delete allow in on wg0 out on eth0
+          PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+          # Client Peer 1: Germany Omada Gateway
+          [Peer]
+          PublicKey = {{ germany_01_public_key }}
+          AllowedIPs = {{ germany_01_ip }}, {{ germany_01_lan }}
+
+          # Client Peer 2: Kenya Omada Gateway
+          [Peer]
+          PublicKey = {{ kenya_01_public_key }}
+          AllowedIPs = {{ kenya_01_ip }}, {{ kenya_01_lan }}
+
+          # Client Peer 3: Admin 01 (MacBook)
+          [Peer]
+          PublicKey = {{ admin_01_public_key }}
+          AllowedIPs = {{ admin_01_ip }}
+      notify: Restart WireGuard
+
+    # --- GENERATE CLIENT CONFIGURATIONS ---
+
+    - name: Create directory for client configurations
+      ansible.builtin.file:
+        path: /etc/wireguard/clients
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Generate Germany 01 client configuration (wg0-germany-01.conf)
+      ansible.builtin.copy:
+        dest: /etc/wireguard/clients/wg0-germany-01.conf
+        mode: '0600'
+        content: |
+          [Interface]
+          PrivateKey = {{ germany_01_private_key }}
+          Address = 10.8.0.2/24
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = {{ server_public_key }}
+          Endpoint = edge.knoer.net:{{ vpn_port }}
+          AllowedIPs = {{ vpn_network }}, {{ kenya_01_lan }}
+          PersistentKeepalive = 25
+
+    - name: Generate Kenya 01 client configuration (wg0-kenya-01.conf)
+      ansible.builtin.copy:
+        dest: /etc/wireguard/clients/wg0-kenya-01.conf
+        mode: '0600'
+        content: |
+          [Interface]
+          PrivateKey = {{ kenya_01_private_key }}
+          Address = 10.8.0.3/24
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = {{ server_public_key }}
+          Endpoint = edge.knoer.net:{{ vpn_port }}
+          AllowedIPs = {{ vpn_network }}, {{ germany_01_lan }}
+          PersistentKeepalive = 25
+
+    - name: Generate Admin 01 client configuration (wg0-admin-01.conf)
+      ansible.builtin.copy:
+        dest: /etc/wireguard/clients/wg0-admin-01.conf
+        mode: '0600'
+        content: |
+          [Interface]
+          PrivateKey = {{ admin_01_private_key }}
+          Address = 10.8.0.4/24
+          DNS = 1.1.1.1
+
+          [Peer]
+          PublicKey = {{ server_public_key }}
+          Endpoint = edge.knoer.net:{{ vpn_port }}
+          AllowedIPs = {{ vpn_network }}, {{ germany_01_lan }}, {{ kenya_01_lan }}
+          PersistentKeepalive = 25
+
+    # --- SERVICE START & SECURITY MESH ---
+
+    - name: Allow WireGuard port in local UFW firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ vpn_port | string }}"
+        proto: udp
+
+    - name: Enable and start WireGuard Systemd service
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: Restart WireGuard
+      ansible.builtin.systemd:
+        name: wg-quick@wg0
+        state: restarted

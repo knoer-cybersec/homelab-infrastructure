@@ -1,0 +1,64 @@
+- name: Deploy Nginx Reverse Proxy and Web Security
+  hosts: edge_nodes
+  gather_facts: true
+  become: true
+  vars:
+    admin_user: ansible_admin
+
+  tasks:
+    - name: Install Nginx, Certbot and security dependencies
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - crowdsec-nginx-bouncer
+        state: present
+        update_cache: yes
+
+    - name: Deploy hardened global SSL parameters
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/ssl-global.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Modern, secure TLS baseline (Mozilla Modern Profile)
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers on;
+          ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+          
+          # Performance tunings for reverse proxy operations
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 1d;
+          ssl_session_tickets off;
+          
+          # HSTS (HTTP Strict Transport Security) - Force HTTPS for 1 Year
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+          
+          # Defend against clickjacking & cross-site scripting (XSS)
+          add_header X-Frame-Options DENY always;
+          add_header X-Content-Type-Options nosniff always;
+          add_header X-XSS-Protection "1; mode=block" always;
+      notify: Reload Nginx
+
+    - name: Open Web ports in local UFW firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "80"
+        - "443"
+
+    - name: Ensure Nginx is enabled at boot and active
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: Reload Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

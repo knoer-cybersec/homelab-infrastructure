@@ -1,0 +1,156 @@
+---
+- name: Deploy Nginx Reverse Proxy with Cloudflare Wildcard SSL and CrowdSec L7 IPS
+  hosts: edge_nodes
+  gather_facts: true
+  become: true
+  
+  # =========================================================================
+  # TERRAFORM ANALOGY (.tfvars):
+  # Load local, unversioned secret variables from 'ansible.asvars'.
+  # =========================================================================
+  vars_files:
+    - ansible.asvars
+
+  vars:
+    admin_user: ansible_admin
+
+  tasks:
+    - name: Verify Cloudflare API Token is loaded successfully
+      ansible.builtin.fail:
+        msg: "ERROR: The Cloudflare API Token is empty! Please fill 'cloudflare_api_token' in your local 'ansible.asvars' file."
+      when: cloudflare_api_token is undefined or cloudflare_api_token | length == 0
+      delegate_to: localhost
+      become: false
+
+    - name: Install Nginx, Certbot, and required DNS plugins
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - python3-certbot-dns-cloudflare
+          - crowdsec-nginx-bouncer
+        state: present
+        update_cache: yes
+
+    - name: Ensure Let's Encrypt configuration directory exists
+      ansible.builtin.file:
+        path: /etc/letsencrypt
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+
+    - name: Deploy Cloudflare API Credentials with strict permissions
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/cloudflare.ini
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          # Cloudflare API token used by Certbot for DNS-01 Challenge
+          dns_cloudflare_api_token = "{{ cloudflare_api_token }}"
+
+    # --- IDEMPOTENT & SELF-HEALING CROWDSEC SETUP ---
+
+    - name: Check if CrowdSec Nginx Bouncer has a valid 32-character API key configured
+      ansible.builtin.shell: |
+        grep -Ei "^api_key\s*=\s*[a-zA-Z0-9]{32}" /etc/crowdsec/bouncers/crowdsec-nginx-bouncer.conf || true
+      register: bouncer_key_check
+      changed_when: false
+
+    - name: Delete orphaned bouncer from CrowdSec database if key is missing
+      ansible.builtin.shell: |
+        cscli bouncers delete nginx-bouncer || true
+      when: bouncer_key_check.stdout == ""
+      changed_when: true
+
+    - name: Register Nginx bouncer in local CrowdSec Security Engine
+      ansible.builtin.shell: |
+        cscli bouncers add nginx-bouncer
+      register: bouncer_register_output
+      when: bouncer_key_check.stdout == ""
+      changed_when: true
+
+    - name: Extract the 32-character API key safely
+      ansible.builtin.set_fact:
+        crowdsec_api_key: "{{ bouncer_register_output.stdout | default('') | regex_search('[a-zA-Z0-9]{32}') }}"
+      when: bouncer_key_check.stdout == ""
+
+    - name: Write the extracted CrowdSec API key to bouncer config
+      ansible.builtin.replace:
+        path: /etc/crowdsec/bouncers/crowdsec-nginx-bouncer.conf
+        regexp: '(?i)^api_key\s*=\s*.*'
+        replace: "API_KEY={{ crowdsec_api_key }}"
+      when:
+        - bouncer_key_check.stdout == ""
+        - crowdsec_api_key is defined
+        - crowdsec_api_key | length == 32
+      notify: Reload Nginx
+
+    - name: Configure the correct CrowdSec Local API Endpoint in Nginx Bouncer config
+      ansible.builtin.replace:
+        path: /etc/crowdsec/bouncers/crowdsec-nginx-bouncer.conf
+        regexp: '(?i)^api_url\s*=\s*.*'
+        replace: "API_URL=http://127.0.0.1:8080/"
+      notify: Reload Nginx
+
+    # --- NGINX CONFIGURATION ---
+
+    - name: Comment out default conflicting SSL settings in main nginx.conf
+      ansible.builtin.replace:
+        path: /etc/nginx/nginx.conf
+        regexp: '^(\s*)(ssl_protocols|ssl_prefer_server_ciphers|ssl_ciphers)(\s+[^;]+;)'
+        replace: '\1# \2\3 # Commented out by Ansible to prevent duplicates'
+      notify: Reload Nginx
+
+    - name: Deploy hardened global SSL parameters (Mozilla Modern Profile)
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/ssl-global.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Modern, secure TLS baseline
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers on;
+          ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+          
+          # Performance tunings for reverse proxy operations
+          ssl_session_cache shared:SSL:10m;
+          ssl_session_timeout 1d;
+          ssl_session_tickets off;
+          
+          # HSTS (HTTP Strict Transport Security) - Force HTTPS for 1 Year
+          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+          
+          # Defend against clickjacking & cross-site scripting (XSS)
+          add_header X-Frame-Options DENY always;
+          add_header X-Content-Type-Options nosniff always;
+          add_header X-XSS-Protection "1; mode=block" always;
+      notify: Reload Nginx
+
+    - name: Open HTTP and HTTPS ports in local UFW firewall
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "80"
+        - "443"
+
+    - name: Ensure Nginx is enabled at boot and active
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+    - name: Validate Nginx configuration syntax (Pre-flight check)
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+  handlers:
+    - name: Reload Nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded

@@ -1,0 +1,74 @@
+# ==============================================================================
+# Ansible Playbook: Phase 1 Core Node Provisioning & Hardening
+# Targeting: Cloud Edge Gateway (Debian 12 Instance)
+# ==============================================================================
+---
+- name: "Phase 1: Secure Edge VPS Hardening & WireGuard Orchestration"
+  hosts: vps
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # --- SECTION 1: OS SECURITY HARDENING ---
+    - name: "Security: Execute apt cache update and full package upgrade"
+      apt:
+        update_cache: yes
+        upgrade: dist
+        cache_valid_time: 3600
+
+    - name: "Security: Install enterprise baseline packages"
+      apt:
+        name:
+          - nftables
+          - wireguard
+          - qrencode
+          - fail2ban
+        state: present
+
+    - name: "Security: Enforce hardened OpenSSH configuration policies"
+      copy:
+        dest: /etc/ssh/sshd_config.d/hardening.conf
+        content: |
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          X11Forwarding no
+          MaxAuthTries 3
+          AllowAgentForwarding no
+        mode: '0644'
+      notify: Restart ssh daemon
+
+    # --- SECTION 2: CRYPTOGRAPHIC TRANSIT LAYER (WIREGUARD) ---
+    - name: "Network: Check for pre-existing WireGuard asymmetric keypair"
+      stat:
+        path: /etc/wireguard/private.key
+      register: wg_private_key_file
+
+    - name: "Network: Generate secure WireGuard private/public keys if missing"
+      shell: |
+        umask 077
+        wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key
+      when: not wg_private_key_file.stat.exists
+
+    - name: "Network: Ingest WireGuard private key token into memory"
+      slurp:
+        src: /etc/wireguard/private.key
+      register: wg_private_key_encoded
+
+    - name: "Network: Materialize local WireGuard Interface configuration (wg0)"
+      template:
+        src: templates/wg0.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        mode: '0600'
+      notify: Restart wireguard daemon
+
+  # --- HANDLERS: ASYNCHRONOUS STATE ENFORCEMENT ---
+  handlers:
+    - name: Restart ssh daemon
+      service:
+        name: ssh
+        state: restarted
+
+    - name: Restart wireguard daemon
+      service:
+        name: wg-quick@wg0
+        state: restarted
