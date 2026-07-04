@@ -6,3 +6,8 @@
 *.asvars
 .ansible_vault_pass
 secrets.yml
+
+# --- Obsidian App-Settings & Layouts ---
+docs/.obsidian/workspace.json
+docs/.obsidian/workspace-mobile.json
+docs/.obsidian/backups/

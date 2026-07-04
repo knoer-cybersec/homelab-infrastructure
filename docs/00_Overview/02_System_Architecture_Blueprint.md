@@ -1,13 +1,13 @@
-🗺️ Distributed Edge Hub & Hybrid GitOps Infrastructure
+# 🗺️ Hybrid Cloud & Edge GitOps Architecture
+> **The Big Picture: Decoupled Control, Private Data Sovereignty & Edge Autonomy**
 
-The Schaufenster Integration Platform • Decoupled Control, Private Data Sovereignty & Edge Autonomy
+This blueprint defines the final target state of our distributed infrastructure. It details the separation between our **Cloud Gateway Plane** (Cloud VPS), our **Cloud Control Plane** (Management), and our **Local Edge Planes** (Location 1 & Location 2) running Kubernetes on Proxmox.
 
-Welcome to the Schaufenster Integration Platform repository. This infrastructure-as-code (IaC) and configuration-management codebase models a production-grade, highly resilient, and zero-trust hybrid network.
+---
 
-The architecture is designed with Security by Design principles, strictly separating our public Gateway and Control Plane (running on Cloud VPS nodes) from our private Data Plane (regional nodes running at local sites named Location 1 and Location 2 on physical Proxmox VE clusters).
+## 🏛️ Comprehensive Architecture Diagram
 
-🏛️ Comprehensive Architecture Blueprint
-
+```text
                                  [ CLOUDFLARE ANYCAST EDGE ]
                                               │
                       ┌───────────────────────┴───────────────────────┐
@@ -38,61 +38,36 @@ The architecture is designed with Security by Design principles, strictly separa
         │    │  - Mailcow Backend (Mailboxes)  │    │                                   │    │  - Home Assistant L2 (Local HA) │    │
         │    │  - Nextcloud Core & Databases   │    │                                   │    │  - Local MQTT & Node-RED        │    │
         │    │  - Home Assistant L1 (Local HA) │    │                                   │    │  - Frigate NVR (AI Object Det.) │    │
+        │    │  - GitLab / Gitea Runner        │    │                                   │    │  - Local Caching & Sync Agent   │    │
         │    └─────────────────────────────────┘    │                                   │    └─────────────────────────────────┘    │
         └───────────────────────────────────────────┘                                   └───────────────────────────────────────────┘
+```
 
+---
 
-📂 Repository Layout
+## ✉️ 1. The Secure Mail Architecture (Cloud SMTP-Relay ➔ Local Mailbox)
+Operating a mail server directly from a home connection fails due to dynamic IPs, lack of PTR (Reverse DNS) configuration, and IP blocks on global spam lists. However, hosting your mailboxes in the cloud compromises data privacy. 
 
-This repository is split into three clean execution and documentation planes:
+We solve this using a **Split SMTP Architecture**:
 
-/terraform (Provisioning Plane):
+### Inbound E-Mail Flow:
+1.  An external server sends an email to `user@yourdomain.com`.
+2.  The DNS MX-record routing points to **VPS 2 (Cloud Control & Mail Relay)**.
+3.  The Cloud Relay receives the email on Port `25` (secured with TLS/DKIM checks).
+4.  The VPS immediately forwards the email **through the secure WireGuard tunnel** to the local **Mailcow Instance** running inside your **Kubernetes Cluster in Location 1** (`10.8.0.2` or internal routed IP).
+5.  The mail is stored on your own physical disks in Site A.
 
-Declarative Infrastructure-as-Code files (main.tf, providers.tf) to spin up cloud compute resources on public clouds (Hetzner Cloud VPS) safely.
+---
 
-/ansible (Configuration Plane):
+## ☸️ 2. The Role of Kubernetes on Proxmox (Location 1 & Location 2)
+Running Kubernetes (via a lightweight distro like **k3s** or **Talos Linux**) on Proxmox VE provides cloud-native scaling, self-healing, and GitOps workflows.
 
-Multi-playbook orchestration setup to harden operating systems, deploy the Docker container runtime, boot TP-Link Omada SDN, configure WireGuard Site-to-Site VPN meshes, and manage CrowdSec IDS/IPS.
+### 🇩🇪 Location 1 Cluster (Site A Core) — Datacenter Class
+* **Mailcow Backend VMs:** Holding Dovecot, Postfix, and Mailbox databases.
+* **Nextcloud Instance:** Connected to your high-capacity local RAID storage.
+* **Central Databases:** Highly-available clustered database engines (Postgres, MariaDB).
+* **Home Assistant L1 (Core instance):** Interacting with your local smart home appliances.
 
-/docs (Documentation Plane):
-
-A completely integrated Obsidian Knowledge Base (Vault) housing our technical textbooks, manual registrar settings, network diagrams, and disaster recovery runbooks.
-
-Start reading here: docs/00_Overview/README.md
-
-🔒 Security Baseline & Secret Isolation
-
-This showcase repository is designed to be fully public while keeping live infrastructure endpoints, passwords, and private cryptographic keys 100% secure.
-
-Variable Abstraction: All sensitive tokens (like Cloudflare DNS APIs) are isolated into unversioned variable sheets (ansible.asvars) and managed dynamically at runtime using local OS environment variables.
-
-Loose Key Protection: Private cryptographic keys (SSH, WireGuard) are generated dynamically on target nodes using idempotent scripting and are never committed to version control.
-
-State File Protection: Local Terraform state files (.tfstate) containing system telemetry are strictly blacklisted from tracking using strict root-level .gitignore boundaries.
-
-🛠️ Quick Start & Execution
-
-1. Cloud Provisioning
-
-cd terraform/hcloud_vps
-terraform init
-terraform plan -out=tfplan.binary
-terraform apply tfplan.binary
-
-
-2. System Hardening & Configuration Mesh
-
-cd ../../ansible
-# Perform base OS hardening (Moves SSH, configures firewall/fail2ban)
-ansible-playbook -i inventory.ini playbooks/site.yml
-
-# Establish the WireGuard site-to-site VPN mesh & client routing
-ansible-playbook -i inventory.ini playbooks/wireguard.yml
-
-# Deploy edge proxies & Collaborative IDS/IPS
-ansible-playbook -i inventory.ini playbooks/nginx_proxy.yml
-
-
-📄 License
-
-This repository is licensed under the MIT License. Feel free to use, modify, and learn from these playbooks to automate your own decentralized home infrastructures.
+### 🇰🇪 Location 2 Cluster (Site B Edge) — Heavy-Duty Autonomy
+* **Home Assistant L2 (Edge instance):** Operates all local smart devices, smart locks, and localized automated flows. *If the fiber connection to the VPS cuts out, the house continues to work autonomously.*
+* **Frigate NVR (Network Video Recorder):** Video processing is highly resource-intensive. Running this locally on the K8s cluster keeps massive video bandwidth off your internet connection.
